@@ -91,6 +91,7 @@ type Query {
 
   me: User
   agents: [User!]!
+  users: [User!]!
 }
 
 type Mutation {
@@ -98,12 +99,18 @@ type Mutation {
     name: String!
     email: String!
     password: String!
+    role: UserRole!
   ): AuthPayload!
 
   login(
     email: String!
     password: String!
   ): AuthPayload!
+
+  updateUserRole(
+  userId: ID!
+  role: UserRole!
+  ): User!
 
   createTicket(
     title: String!

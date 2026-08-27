@@ -168,6 +168,25 @@ export const resolvers = {
             });
         },
 
+
+        // --------------------------------
+        // CREATE USER
+        // --------------------------------
+
+        users: async (
+            _: unknown,
+            __: unknown,
+            context: Context
+        ) => {
+            requireRole(context, ["ADMIN"]);
+
+            return prisma.user.findMany({
+                orderBy: {
+                    createdAt: "desc",
+                },
+            });
+        },
+
         // --------------------------------
         // CURRENT USER
         // --------------------------------
@@ -190,6 +209,7 @@ export const resolvers = {
                 name: string;
                 email: string;
                 password: string;
+                role: "USER" | "AGENT" | "ADMIN";
             }
         ) => {
             const existingUser =
@@ -214,11 +234,18 @@ export const resolvers = {
             const passwordHash =
                 await hashPassword(args.password);
 
+            if (args.role === "ADMIN") {
+                throw new Error(
+                    "ADMIN accounts cannot be created through public registration."
+                );
+            }
+
             const user = await prisma.user.create({
                 data: {
                     name: args.name,
                     email: args.email,
                     passwordHash,
+                    role: args.role,
                 },
             });
 
@@ -361,6 +388,46 @@ export const resolvers = {
                     status: "IN_PROGRESS",
                 },
                 include: ticketInclude,
+            });
+        },
+
+
+        // --------------------------------
+        // UPDATE USERROLE
+        // --------------------------------
+        updateUserRole: async (
+            _: unknown,
+            args: {
+                userId: string;
+                role: "USER" | "AGENT" | "ADMIN";
+            },
+            context: Context
+        ) => {
+            const currentUser = requireRole(context, ["ADMIN"]);
+
+            if (currentUser.id === args.userId) {
+                throw new Error(
+                    "You cannot change your own role"
+                );
+            }
+
+            const user = await prisma.user.findUnique({
+                where: {
+                    id: args.userId,
+                },
+            });
+
+            if (!user) {
+                throw new Error("User not found");
+            }
+
+            return prisma.user.update({
+                where: {
+                    id: args.userId,
+                },
+                data: {
+                    role: args.role,
+                },
             });
         },
 
