@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: support-ticket-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: support_user
+      POSTGRES_PASSWORD: support_password
+      POSTGRES_DB: support_ticket_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - support_ticket_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support_user -d support_ticket_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  support_ticket_postgres_data:
