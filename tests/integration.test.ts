@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { prisma } from "../src/lib/prisma";
+import { calculateSlaDeadlines } from "../src/sla/sla";
 
 describe("Support Ticket Integration", () => {
-  it("should create a ticket with the correct SLA configuration", async () => {
-    // Find an existing USER
+  it("should create a ticket with calculated SLA deadlines in PostgreSQL", async () => {
     const user = await prisma.user.findFirst({
       where: {
         role: "USER",
@@ -16,7 +16,15 @@ describe("Support Ticket Integration", () => {
       throw new Error("No USER found in database");
     }
 
-    const before = new Date();
+    const holidays = new Set<string>();
+
+    const createdAt = new Date();
+
+    const sla = calculateSlaDeadlines(
+      createdAt,
+      "HIGH",
+      holidays,
+    );
 
     const ticket = await prisma.ticket.create({
       data: {
@@ -24,9 +32,8 @@ describe("Support Ticket Integration", () => {
         description: "Created by Vitest integration test",
         priority: "HIGH",
         creatorId: user.id,
-        slaDeadline: new Date(
-          before.getTime() + 8 * 60 * 60 * 1000
-        ),
+        firstResponseDueAt: sla.firstResponseDueAt,
+        resolutionDueAt: sla.resolutionDueAt,
       },
     });
 
@@ -34,18 +41,25 @@ describe("Support Ticket Integration", () => {
     expect(ticket.title).toBe("Integration Test Ticket");
     expect(ticket.priority).toBe("HIGH");
     expect(ticket.status).toBe("OPEN");
-    expect(ticket.slaStatus).toBe("ON_TRACK");
     expect(ticket.creatorId).toBe(user.id);
 
-    // HIGH priority = 8-hour SLA
-    const difference =
-      ticket.slaDeadline.getTime() - before.getTime();
+    expect(ticket.firstResponseDueAt).not.toBeNull();
+    expect(ticket.resolutionDueAt).not.toBeNull();
 
-    expect(difference).toBeGreaterThanOrEqual(
-      8 * 60 * 60 * 1000 - 1000
+    expect(ticket.firstResponseDueAt).toEqual(
+      sla.firstResponseDueAt,
     );
 
-    // Cleanup test data
+    expect(ticket.resolutionDueAt).toEqual(
+      sla.resolutionDueAt,
+    );
+
+    expect(
+      ticket.resolutionDueAt!.getTime(),
+    ).toBeGreaterThan(
+      ticket.firstResponseDueAt!.getTime(),
+    );
+
     await prisma.ticket.delete({
       where: {
         id: ticket.id,

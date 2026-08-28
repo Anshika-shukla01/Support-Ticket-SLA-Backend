@@ -9,7 +9,13 @@ import {
     requireRole,
 } from "../auth/authorization";
 import type { Context } from "../auth/context";
-import { calculateSlaDeadline } from "../sla/sla";
+import {
+    BUSINESS_TIMEZONE,
+    calculateSlaDeadlines,
+    calculateSLAState,
+    calculateRemainingBusinessMinutes,
+} from "../sla/sla";
+import { DateTime } from "luxon";
 
 type TicketPriority =
     | "LOW"
@@ -33,7 +39,125 @@ const ticketInclude = {
     },
 };
 
+const ALLOWED_STATUS_TRANSITIONS: Record<
+    TicketStatus,
+    TicketStatus[]
+> = {
+    OPEN: ["IN_PROGRESS"],
+    IN_PROGRESS: ["RESOLVED"],
+    RESOLVED: ["CLOSED"],
+    CLOSED: [],
+};
+
+function validateStatusTransition(
+    current: TicketStatus,
+    next: TicketStatus
+): void {
+    if (current === next) {
+        return;
+    }
+
+    if (
+        !ALLOWED_STATUS_TRANSITIONS[
+            current
+        ].includes(next)
+    ) {
+        throw new Error(
+            `Invalid status transition: ${current} → ${next}`
+        );
+    }
+}
+
+async function getHolidayKeys(): Promise<Set<string>> {
+    const holidays = await prisma.holiday.findMany({
+        select: {
+            date: true,
+        },
+    });
+
+    return new Set(
+        holidays.map((holiday) =>
+            DateTime.fromJSDate(holiday.date, {
+                zone: BUSINESS_TIMEZONE,
+            }).toISODate()!
+        )
+    );
+}
+
 export const resolvers = {
+    // --------------------------------
+    // TICKETS RESOLVER
+    // --------------------------------
+    Ticket: {
+        firstResponseDueAt: (
+            ticket: {
+                firstResponseDueAt: Date;
+            }
+        ) => ticket.firstResponseDueAt.toISOString(),
+
+        resolutionDueAt: (
+            ticket: {
+                resolutionDueAt: Date;
+            }
+        ) => ticket.resolutionDueAt.toISOString(),
+
+        sla: async (
+            ticket: {
+                createdAt: Date;
+                firstResponseDueAt: Date;
+                resolutionDueAt: Date;
+                firstResponseAt: Date | null;
+                resolvedAt: Date | null;
+            }
+        ) => {
+            const holidays =
+                await getHolidayKeys();
+
+            const now = new Date();
+
+            return {
+                firstResponseDueAt:
+                    ticket.firstResponseDueAt.toISOString(),
+
+                resolutionDueAt:
+                    ticket.resolutionDueAt.toISOString(),
+
+                firstResponseState:
+                    calculateSLAState(
+                        ticket.createdAt,
+                        ticket.firstResponseDueAt,
+                        ticket.firstResponseAt,
+                        now,
+                        holidays
+                    ),
+
+                resolutionState:
+                    calculateSLAState(
+                        ticket.createdAt,
+                        ticket.resolutionDueAt,
+                        ticket.resolvedAt,
+                        now,
+                        holidays
+                    ),
+
+                firstResponseRemainingMinutes:
+                    calculateRemainingBusinessMinutes(
+                        ticket.firstResponseDueAt,
+                        ticket.firstResponseAt,
+                        now,
+                        holidays
+                    ),
+
+                resolutionRemainingMinutes:
+                    calculateRemainingBusinessMinutes(
+                        ticket.resolutionDueAt,
+                        ticket.resolvedAt,
+                        now,
+                        holidays
+                    ),
+            };
+        },
+    },
     Query: {
         // --------------------------------
         // GET ALL TICKETS
@@ -153,6 +277,24 @@ export const resolvers = {
         },
 
         // --------------------------------
+        // GET HOLIDAY QUERY
+        // --------------------------------
+
+        holidays: async (
+            _: unknown,
+            __: unknown,
+            context: Context
+        ) => {
+            requireAuth(context);
+
+            return prisma.holiday.findMany({
+                orderBy: {
+                    date: "asc",
+                },
+            });
+        },
+
+        // --------------------------------
         // AGENTS
         // --------------------------------
         agents: async (
@@ -160,7 +302,10 @@ export const resolvers = {
             __: unknown,
             context: Context
         ) => {
-            requireRole(context, ["ADMIN"]);
+            const user = requireRole(
+                context,
+                ["AGENT", "ADMIN"]
+            );
 
             return prisma.user.findMany({
                 where: { role: "AGENT" },
@@ -178,7 +323,10 @@ export const resolvers = {
             __: unknown,
             context: Context
         ) => {
-            requireRole(context, ["ADMIN"]);
+            const user = requireRole(
+                context,
+                ["AGENT", "ADMIN"]
+            );
 
             return prisma.user.findMany({
                 orderBy: {
@@ -314,19 +462,37 @@ export const resolvers = {
         ) => {
             const user = requireAuth(context);
 
-            const slaDeadline =
-                calculateSlaDeadline(
-                    new Date(),
-                    args.priority
-                );
+            if (args.title.trim().length === 0) {
+                throw new Error("Title cannot be empty");
+            }
+
+            if (args.description.trim().length === 0) {
+                throw new Error("Description cannot be empty");
+            }
+
+            const createdAt = new Date();
+
+            const holidays =
+                await getHolidayKeys();
+
+            const {
+                firstResponseDueAt,
+                resolutionDueAt,
+            } = calculateSlaDeadlines(
+                createdAt,
+                args.priority,
+                holidays
+            );
 
             return prisma.ticket.create({
                 data: {
-                    title: args.title,
-                    description: args.description,
+                    title: args.title.trim(),
+                    description: args.description.trim(),
                     priority: args.priority,
                     creatorId: user.id,
-                    slaDeadline,
+                    firstResponseDueAt,
+                    resolutionDueAt,
+                    createdAt,
                 },
                 include: ticketInclude,
             });
@@ -343,9 +509,10 @@ export const resolvers = {
             },
             context: Context
         ) => {
-            requireRole(context, [
-                "ADMIN",
-            ]);
+            const user = requireRole(
+                context,
+                ["AGENT", "ADMIN"]
+            );
 
             const agent =
                 await prisma.user.findUnique({
@@ -386,6 +553,66 @@ export const resolvers = {
                 data: {
                     agentId: args.agentId,
                     status: "IN_PROGRESS",
+                },
+                include: ticketInclude,
+            });
+        },
+
+        // --------------------------------
+        // RESOLVE TICKET
+        // --------------------------------
+
+        resolveTicket: async (
+            _: unknown,
+            args: {
+                ticketId: string;
+            },
+            context: Context
+        ) => {
+            const user = requireAuth(context);
+
+            const ticket =
+                await prisma.ticket.findUnique({
+                    where: {
+                        id: args.ticketId,
+                    },
+                });
+
+            if (!ticket) {
+                throw new Error(
+                    "Ticket not found"
+                );
+            }
+
+            if (user.role === "USER") {
+                throw new Error(
+                    "Users cannot resolve tickets"
+                );
+            }
+
+            if (
+                user.role === "AGENT" &&
+                ticket.agentId !== user.id
+            ) {
+                throw new Error(
+                    "You are not allowed to resolve this ticket"
+                );
+            }
+
+            validateStatusTransition(
+                ticket.status,
+                "RESOLVED"
+            );
+
+            const resolvedAt = new Date();
+
+            return prisma.ticket.update({
+                where: {
+                    id: ticket.id,
+                },
+                data: {
+                    status: "RESOLVED",
+                    resolvedAt,
                 },
                 include: ticketInclude,
             });
@@ -457,6 +684,11 @@ export const resolvers = {
                 );
             }
 
+            validateStatusTransition(
+                ticket.status,
+                args.status
+            );
+
             // USER cannot manage ticket status
             if (user.role === "USER") {
                 throw new Error(
@@ -481,15 +713,6 @@ export const resolvers = {
             } = {
                 status: args.status,
             };
-
-            // First response
-            if (
-                !ticket.firstResponseAt &&
-                args.status === "IN_PROGRESS"
-            ) {
-                data.firstResponseAt =
-                    new Date();
-            }
 
             // Resolution
             if (
@@ -573,7 +796,7 @@ export const resolvers = {
 
             // Track first response
             if (
-                user.role === "AGENT" &&
+                user.id !== ticket.creatorId &&
                 !ticket.firstResponseAt
             ) {
                 await prisma.ticket.update({

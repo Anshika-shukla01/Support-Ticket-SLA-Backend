@@ -62,22 +62,23 @@ model Ticket {
   agentId     String?
   agent       User?          @relation("TicketAgent", fields: [agentId], references: [id])
 
-  firstResponseAt DateTime?
-  resolvedAt      DateTime?
+  firstResponseAt   DateTime?
+  firstResponseDueAt DateTime?
 
-  slaDeadline DateTime
-  slaStatus   SLAStatus @default(ON_TRACK)
+  resolvedAt        DateTime?
+  resolutionDueAt   DateTime
 
   comments    Comment[]
 
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   @@index([creatorId])
   @@index([agentId])
   @@index([status])
   @@index([priority])
-  @@index([slaStatus])
+  @@index([firstResponseDueAt])
+  @@index([resolutionDueAt])
 }
 
 model Comment {
@@ -93,4 +94,12 @@ model Comment {
   createdAt DateTime @default(now())
 
   @@index([ticketId])
+}
+
+model Holiday {
+  id        String   @id @default(uuid())
+  date      DateTime @unique
+  name      String
+
+  createdAt DateTime @default(now())
 }

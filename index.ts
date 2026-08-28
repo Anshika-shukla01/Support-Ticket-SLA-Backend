@@ -5,7 +5,9 @@ await bootstrapAdmin();
 
 const server = Bun.serve({
     port: 4000,
-    fetch: yoga,
+    fetch: async (request) => {
+        return yoga.fetch(request);
+    },
 });
 
 console.log(

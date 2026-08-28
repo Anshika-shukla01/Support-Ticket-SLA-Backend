@@ -24,6 +24,23 @@ enum SLAStatus {
   BREACHED
 }
 
+enum SLAState {
+  ON_TRACK
+  AT_RISK
+  BREACHED
+}
+
+type SLAInfo {
+  firstResponseDueAt: String!
+  resolutionDueAt: String!
+
+  firstResponseState: SLAState!
+  resolutionState: SLAState!
+
+  firstResponseRemainingMinutes: Int!
+  resolutionRemainingMinutes: Int!
+}
+
 type User {
   id: ID!
   name: String!
@@ -39,6 +56,13 @@ type Comment {
   createdAt: String!
 }
 
+type Holiday {
+  id: ID!
+  date: String!
+  name: String!
+  createdAt: String!
+}
+
 type Ticket {
   id: ID!
   title: String!
@@ -49,11 +73,13 @@ type Ticket {
   creator: User!
   agent: User
 
-  firstResponseAt: String
-  resolvedAt: String
+   firstResponseAt: String
+  firstResponseDueAt: String!
 
-  slaDeadline: String!
-  slaStatus: SLAStatus!
+  resolvedAt: String
+  resolutionDueAt: String!
+
+  sla: SLAInfo!
 
   comments: [Comment!]!
 
@@ -92,6 +118,7 @@ type Query {
   me: User
   agents: [User!]!
   users: [User!]!
+  holidays: [Holiday!]!
 }
 
 type Mutation {
@@ -122,6 +149,10 @@ type Mutation {
     ticketId: ID!
     agentId: ID!
   ): Ticket!
+
+  resolveTicket(
+  ticketId: ID!
+): Ticket!
 
   updateTicketStatus(
     ticketId: ID!
