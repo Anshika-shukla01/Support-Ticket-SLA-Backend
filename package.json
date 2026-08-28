@@ -6,12 +6,15 @@
   "scripts": {
     "dev": "bun --watch index.ts",
     "start": "bun index.ts",
-    "test": "vitest"
+    "test": "vitest",
+    "seed": "bun prisma/seed.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/luxon": "^3.7.5",
     "@types/pg": "^8.23.1",
     "prisma": "^7.10.0",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.11"
   },
   "dependencies": {
@@ -21,6 +24,7 @@
     "graphql": "^17.0.2",
     "graphql-yoga": "^5.22.0",
     "jose": "^6.2.10",
+    "luxon": "^3.7.2",
     "pg": "^8.23.0",
     "zod": "^4.4.3"
   }
