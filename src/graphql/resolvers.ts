@@ -1,21 +1,37 @@
+import { DateTime } from "luxon";
+
 import { prisma } from "../lib/prisma";
+
 import {
     hashPassword,
     verifyPassword,
 } from "../auth/password";
+
 import { createToken } from "../auth/jwt";
+
 import {
     requireAuth,
     requireRole,
 } from "../auth/authorization";
+
 import type { Context } from "../auth/context";
+
 import {
     BUSINESS_TIMEZONE,
     calculateSlaDeadlines,
     calculateSLAState,
     calculateRemainingBusinessMinutes,
 } from "../sla/sla";
-import { DateTime } from "luxon";
+
+import {
+    AppError,
+    ERROR_CODES,
+} from "./errors";
+
+
+// ============================================================
+// TYPES
+// ============================================================
 
 type TicketPriority =
     | "LOW"
@@ -29,6 +45,38 @@ type TicketStatus =
     | "RESOLVED"
     | "CLOSED";
 
+type SLAState =
+    | "ON_TRACK"
+    | "AT_RISK"
+    | "BREACHED";
+
+type UserRole =
+    | "USER"
+    | "AGENT"
+    | "ADMIN";
+
+type TicketFilter = {
+    status?: TicketStatus;
+    priority?: TicketPriority;
+    assigneeId?: string;
+    slaState?: SLAState;
+};
+
+type TicketQueryArgs = {
+    filter?: TicketFilter;
+    take?: number;
+    cursor?: string;
+};
+
+type UserQueryArgs = {
+    role?: UserRole;
+};
+
+
+// ============================================================
+// PRISMA INCLUDE
+// ============================================================
+
 const ticketInclude = {
     creator: true,
     agent: true,
@@ -36,8 +84,16 @@ const ticketInclude = {
         include: {
             author: true,
         },
+        orderBy: {
+            createdAt: "asc" as const,
+        },
     },
 };
+
+
+// ============================================================
+// STATUS TRANSITIONS
+// ============================================================
 
 const ALLOWED_STATUS_TRANSITIONS: Record<
     TicketStatus,
@@ -49,6 +105,7 @@ const ALLOWED_STATUS_TRANSITIONS: Record<
     CLOSED: [],
 };
 
+
 function validateStatusTransition(
     current: TicketStatus,
     next: TicketStatus
@@ -57,92 +114,265 @@ function validateStatusTransition(
         return;
     }
 
-    if (
-        !ALLOWED_STATUS_TRANSITIONS[
-            current
-        ].includes(next)
-    ) {
-        throw new Error(
-            `Invalid status transition: ${current} → ${next}`
+    const allowed =
+        ALLOWED_STATUS_TRANSITIONS[current];
+
+    if (!allowed.includes(next)) {
+        throw new AppError(
+            `Ticket cannot transition from ${current} to ${next}.`,
+            ERROR_CODES.INVALID_STATUS_TRANSITION
         );
     }
 }
 
+
+// ============================================================
+// HOLIDAY HELPERS
+// ============================================================
+
 async function getHolidayKeys(): Promise<Set<string>> {
-    const holidays = await prisma.holiday.findMany({
-        select: {
-            date: true,
-        },
-    });
+    const holidays =
+        await prisma.holiday.findMany({
+            select: {
+                date: true,
+            },
+        });
 
     return new Set(
         holidays.map((holiday) =>
-            DateTime.fromJSDate(holiday.date, {
-                zone: BUSINESS_TIMEZONE,
-            }).toISODate()!
+            DateTime.fromJSDate(
+                holiday.date,
+                {
+                    zone: BUSINESS_TIMEZONE,
+                }
+            ).toISODate()!
         )
     );
 }
 
-export const resolvers = {
-    // --------------------------------
-    // TICKETS RESOLVER
-    // --------------------------------
-    Ticket: {
-        firstResponseDueAt: (
-            ticket: {
-                firstResponseDueAt: Date;
-            }
-        ) => ticket.firstResponseDueAt.toISOString(),
 
-        resolutionDueAt: (
+// ============================================================
+// CURSOR HELPERS
+// ============================================================
+
+function encodeCursor(id: string): string {
+    return Buffer
+        .from(id, "utf8")
+        .toString("base64url");
+}
+
+
+function decodeCursor(cursor: string): string {
+    try {
+        return Buffer
+            .from(cursor, "base64url")
+            .toString("utf8");
+    } catch {
+        throw new AppError(
+            "Invalid pagination cursor.",
+            ERROR_CODES.VALIDATION_ERROR
+        );
+    }
+}
+
+
+// ============================================================
+// SLA CALCULATION HELPER
+// ============================================================
+
+type TicketWithSla = {
+    ticket: Awaited<
+        ReturnType<
+            typeof prisma.ticket.findUnique
+        >
+    >;
+    firstResponseState: SLAState;
+    resolutionState: SLAState;
+};
+
+
+async function calculateTicketSLA(
+    ticket: {
+        createdAt: Date;
+        priority: TicketPriority;
+        firstResponseDueAt: Date | null;
+        resolutionDueAt: Date | null;
+        firstResponseAt: Date | null;
+        resolvedAt: Date | null;
+    },
+    holidays: Set<string>
+) {
+    let firstResponseDueAt = ticket.firstResponseDueAt;
+    let resolutionDueAt = ticket.resolutionDueAt;
+
+    // Older tickets may not have persisted SLA deadlines.
+    // Calculate them from the ticket creation time if missing.
+    if (!firstResponseDueAt || !resolutionDueAt) {
+        const deadlines = calculateSlaDeadlines(
+            ticket.createdAt,
+            ticket.priority,
+            holidays
+        );
+
+        firstResponseDueAt ??= deadlines.firstResponseDueAt;
+        resolutionDueAt ??= deadlines.resolutionDueAt;
+    }
+
+    const now = new Date();
+
+    return {
+        firstResponseDueAt: firstResponseDueAt.toISOString(),
+
+        resolutionDueAt: resolutionDueAt.toISOString(),
+
+        firstResponseState: calculateSLAState(
+            ticket.createdAt,
+            firstResponseDueAt,
+            ticket.firstResponseAt,
+            now,
+            holidays
+        ),
+
+        resolutionState: calculateSLAState(
+            ticket.createdAt,
+            resolutionDueAt,
+            ticket.resolvedAt,
+            now,
+            holidays
+        ),
+
+        firstResponseRemainingMinutes:
+            calculateRemainingBusinessMinutes(
+                firstResponseDueAt,
+                ticket.firstResponseAt,
+                now,
+                holidays
+            ),
+
+        resolutionRemainingMinutes:
+            calculateRemainingBusinessMinutes(
+                resolutionDueAt,
+                ticket.resolvedAt,
+                now,
+                holidays
+            ),
+    };
+}
+
+// ============================================================
+// RESOLVERS
+// ============================================================
+
+export const resolvers = {
+
+    // ========================================================
+    // TICKET
+    // ========================================================
+
+    Ticket: {
+
+        firstResponseDueAt: async (
             ticket: {
-                resolutionDueAt: Date;
+                createdAt: Date;
+                priority: TicketPriority;
+                firstResponseDueAt: Date | null;
             }
-        ) => ticket.resolutionDueAt.toISOString(),
+        ) => {
+            if (ticket.firstResponseDueAt) {
+                return ticket.firstResponseDueAt.toISOString();
+            }
+
+            const holidays = await getHolidayKeys();
+
+            const { firstResponseDueAt } =
+                calculateSlaDeadlines(
+                    ticket.createdAt,
+                    ticket.priority,
+                    holidays
+                );
+
+            return firstResponseDueAt.toISOString();
+        },
+
+        resolutionDueAt: async (
+            ticket: {
+                createdAt: Date;
+                priority: TicketPriority;
+                resolutionDueAt: Date | null;
+            }
+        ) => {
+            if (ticket.resolutionDueAt) {
+                return ticket.resolutionDueAt.toISOString();
+            }
+
+            const holidays = await getHolidayKeys();
+
+            const { resolutionDueAt } =
+                calculateSlaDeadlines(
+                    ticket.createdAt,
+                    ticket.priority,
+                    holidays
+                );
+
+            return resolutionDueAt.toISOString();
+        },
 
         sla: async (
             ticket: {
                 createdAt: Date;
-                firstResponseDueAt: Date;
-                resolutionDueAt: Date;
+                priority: TicketPriority;
+                firstResponseDueAt: Date | null;
+                resolutionDueAt: Date | null;
                 firstResponseAt: Date | null;
                 resolvedAt: Date | null;
             }
         ) => {
-            const holidays =
-                await getHolidayKeys();
+            const holidays = await getHolidayKeys();
+
+            let firstResponseDueAt = ticket.firstResponseDueAt;
+            let resolutionDueAt = ticket.resolutionDueAt;
+
+            console.log("firstResponsedueAt: ", firstResponseDueAt);
+            console.log("type: ", typeof (firstResponseDueAt));
+
+            // Support tickets created before SLA deadlines were persisted.
+            if (!firstResponseDueAt || !resolutionDueAt) {
+                const deadlines = calculateSlaDeadlines(
+                    ticket.createdAt,
+                    ticket.priority,
+                    holidays
+                );
+
+                firstResponseDueAt ??= deadlines.firstResponseDueAt;
+                resolutionDueAt ??= deadlines.resolutionDueAt;
+            }
 
             const now = new Date();
 
             return {
-                firstResponseDueAt:
-                    ticket.firstResponseDueAt.toISOString(),
+                firstResponseDueAt: firstResponseDueAt.toISOString(),
 
-                resolutionDueAt:
-                    ticket.resolutionDueAt.toISOString(),
+                resolutionDueAt: resolutionDueAt.toISOString(),
 
-                firstResponseState:
-                    calculateSLAState(
-                        ticket.createdAt,
-                        ticket.firstResponseDueAt,
-                        ticket.firstResponseAt,
-                        now,
-                        holidays
-                    ),
+                firstResponseState: calculateSLAState(
+                    ticket.createdAt,
+                    firstResponseDueAt,
+                    ticket.firstResponseAt,
+                    now,
+                    holidays
+                ),
 
-                resolutionState:
-                    calculateSLAState(
-                        ticket.createdAt,
-                        ticket.resolutionDueAt,
-                        ticket.resolvedAt,
-                        now,
-                        holidays
-                    ),
+                resolutionState: calculateSLAState(
+                    ticket.createdAt,
+                    resolutionDueAt,
+                    ticket.resolvedAt,
+                    now,
+                    holidays
+                ),
 
                 firstResponseRemainingMinutes:
                     calculateRemainingBusinessMinutes(
-                        ticket.firstResponseDueAt,
+                        firstResponseDueAt,
                         ticket.firstResponseAt,
                         now,
                         holidays
@@ -150,7 +380,7 @@ export const resolvers = {
 
                 resolutionRemainingMinutes:
                     calculateRemainingBusinessMinutes(
-                        ticket.resolutionDueAt,
+                        resolutionDueAt,
                         ticket.resolvedAt,
                         now,
                         holidays
@@ -158,87 +388,230 @@ export const resolvers = {
             };
         },
     },
+
+
+    // ========================================================
+    // QUERY
+    // ========================================================
+
     Query: {
-        // --------------------------------
-        // GET ALL TICKETS
-        // --------------------------------
+
+        // ----------------------------------------------------
+        // TICKETS
+        // ----------------------------------------------------
+
         tickets: async (
             _: unknown,
-            args: {
-                filter?: {
-                    status?: TicketStatus;
-                    priority?: TicketPriority;
-                    slaStatus?: "ON_TRACK" | "AT_RISK" | "BREACHED";
-                };
-                page?: number;
-                pageSize?: number;
-            },
+            args: TicketQueryArgs,
             context: Context
         ) => {
-            requireAuth(context);
 
-            const page = args.page ?? 1;
-            const pageSize = args.pageSize ?? 10;
+            const user =
+                requireAuth(context);
 
-            if (page < 1) {
-                throw new Error("Page must be greater than 0");
-            }
+            const take =
+                args.take ?? 10;
 
-            if (pageSize < 1 || pageSize > 100) {
-                throw new Error(
-                    "Page size must be between 1 and 100"
+            if (
+                !Number.isInteger(take) ||
+                take < 1 ||
+                take > 100
+            ) {
+                throw new AppError(
+                    "take must be between 1 and 100.",
+                    ERROR_CODES.VALIDATION_ERROR
                 );
             }
 
-            const user = requireAuth(context);
+
+            const filter =
+                args.filter ?? {};
+
+
+            // ------------------------------------------------
+            // DATABASE FILTERS
+            // ------------------------------------------------
 
             const where = {
-                ...(user.role === "USER" && { creatorId: user.id }),
-                ...(user.role === "AGENT" && { agentId: user.id }),
-                ...(args.filter?.status && { status: args.filter.status }),
-                ...(args.filter?.priority && { priority: args.filter.priority }),
-                ...(args.filter?.slaStatus && { slaStatus: args.filter.slaStatus }),
+                ...(user.role === "USER"
+                    ? {
+                        creatorId: user.id,
+                    }
+                    : {}),
+
+                ...(filter.status
+                    ? {
+                        status: filter.status,
+                    }
+                    : {}),
+
+                ...(filter.priority
+                    ? {
+                        priority: filter.priority,
+                    }
+                    : {}),
+
+                ...(filter.assigneeId
+                    ? {
+                        agentId:
+                            filter.assigneeId,
+                    }
+                    : {}),
             };
 
-            const skip = (page - 1) * pageSize;
 
-            const [items, total] =
-                await Promise.all([
-                    prisma.ticket.findMany({
-                        where,
-                        include: ticketInclude,
-                        orderBy: {
+            /*
+             * We intentionally don't put SLA state into
+             * Prisma's WHERE clause because SLA state is
+             * derived from the current time + business hours
+             * + holidays.
+             *
+             * Therefore:
+             *
+             * PostgreSQL filtering
+             *        ↓
+             * SLA calculation
+             *        ↓
+             * SLA filtering
+             *        ↓
+             * cursor pagination
+             */
+
+            const tickets =
+                await prisma.ticket.findMany({
+                    where,
+                    include: ticketInclude,
+                    orderBy: [
+                        {
                             createdAt: "desc",
                         },
-                        skip,
-                        take: pageSize,
-                    }),
+                        {
+                            id: "desc",
+                        },
+                    ],
+                });
 
-                    prisma.ticket.count({
-                        where,
-                    }),
-                ]);
+
+            const holidays =
+                await getHolidayKeys();
+
+
+            // ------------------------------------------------
+            // SLA FILTER
+            // ------------------------------------------------
+
+            const filteredTickets =
+                [];
+
+            for (const ticket of tickets) {
+
+                if (!filter.slaState) {
+                    filteredTickets.push(
+                        ticket
+                    );
+
+                    continue;
+                }
+
+                const sla =
+                    await calculateTicketSLA(
+                        ticket,
+                        holidays
+                    );
+
+                const matches =
+                    sla.firstResponseState ===
+                    filter.slaState ||
+                    sla.resolutionState ===
+                    filter.slaState;
+
+                if (matches) {
+                    filteredTickets.push(
+                        ticket
+                    );
+                }
+            }
+
+
+            // ------------------------------------------------
+            // CURSOR
+            // ------------------------------------------------
+
+            let startIndex = 0;
+
+            if (args.cursor) {
+
+                const cursorId =
+                    decodeCursor(
+                        args.cursor
+                    );
+
+                const cursorIndex =
+                    filteredTickets.findIndex(
+                        (ticket) =>
+                            ticket.id ===
+                            cursorId
+                    );
+
+                if (cursorIndex === -1) {
+                    throw new AppError(
+                        "Invalid pagination cursor.",
+                        ERROR_CODES.VALIDATION_ERROR
+                    );
+                }
+
+                startIndex =
+                    cursorIndex + 1;
+            }
+
+
+            // ------------------------------------------------
+            // PAGINATE
+            // ------------------------------------------------
+
+            const nodes =
+                filteredTickets.slice(
+                    startIndex,
+                    startIndex + take
+                );
+
+            const hasNextPage =
+                startIndex + take <
+                filteredTickets.length;
+
+            const lastNode = nodes.at(-1);
+
+            const endCursor = lastNode
+                ? encodeCursor(lastNode.id)
+                : null;
+
 
             return {
-                items,
-                total,
-                page,
-                pageSize,
-                totalPages: Math.ceil(
-                    total / pageSize
-                ),
+                nodes,
+                pageInfo: {
+                    hasNextPage,
+                    endCursor,
+                },
+                totalCount:
+                    filteredTickets.length,
             };
         },
 
-        // --------------------------------
-        // GET SINGLE TICKET
-        // --------------------------------
+
+        // ----------------------------------------------------
+        // SINGLE TICKET
+        // ----------------------------------------------------
+
         ticket: async (
             _: unknown,
-            args: { id: string },
+            args: {
+                id: string;
+            },
             context: Context
         ) => {
-            const user = requireAuth(context);
+
+            const user =
+                requireAuth(context);
 
             const ticket =
                 await prisma.ticket.findUnique({
@@ -248,43 +621,203 @@ export const resolvers = {
                     include: ticketInclude,
                 });
 
+
             if (!ticket) {
-                return null;
+                throw new AppError(
+                    "Ticket not found.",
+                    ERROR_CODES.TICKET_NOT_FOUND
+                );
             }
 
-            // USER can only see their own tickets
+
+            // USER → own tickets only
+
             if (
                 user.role === "USER" &&
                 ticket.creatorId !== user.id
             ) {
-                throw new Error(
-                    "You are not allowed to view this ticket"
+                throw new AppError(
+                    "You are not allowed to view this ticket.",
+                    ERROR_CODES.FORBIDDEN
                 );
             }
 
-            // AGENT can see tickets assigned to them
-            // ADMIN can see everything
-            if (
-                user.role === "AGENT" &&
-                ticket.agentId !== user.id
-            ) {
-                throw new Error(
-                    "You are not allowed to view this ticket"
-                );
-            }
+
+            /*
+             * AGENTS and ADMINS can view tickets.
+             *
+             * This is preferable to restricting an agent
+             * only to tickets already assigned to them,
+             * because agents need to see unassigned tickets
+             * in order to manage the queue.
+             */
 
             return ticket;
         },
 
-        // --------------------------------
-        // GET HOLIDAY QUERY
-        // --------------------------------
+
+        // ----------------------------------------------------
+        // DASHBOARD
+        // ----------------------------------------------------
+
+        dashboard: async (
+            _: unknown,
+            __: unknown,
+            context: Context
+        ) => {
+
+            const user =
+                requireAuth(context);
+
+            const where =
+                user.role === "USER"
+                    ? {
+                        creatorId: user.id,
+                    }
+                    : {};
+
+
+            const tickets =
+                await prisma.ticket.findMany({
+                    where,
+                    select: {
+                        status: true,
+                        priority: true,
+                        createdAt: true,
+                        firstResponseDueAt: true,
+                        resolutionDueAt: true,
+                        firstResponseAt: true,
+                        resolvedAt: true,
+                    },
+                });
+
+
+            const holidays =
+                await getHolidayKeys();
+
+
+            let openTickets = 0;
+            let inProgressTickets = 0;
+            let atRiskTickets = 0;
+            let breachedTickets = 0;
+
+
+            for (const ticket of tickets) {
+
+                if (
+                    ticket.status ===
+                    "OPEN"
+                ) {
+                    openTickets++;
+                }
+
+                if (
+                    ticket.status ===
+                    "IN_PROGRESS"
+                ) {
+                    inProgressTickets++;
+                }
+
+
+                const sla =
+                    await calculateTicketSLA(
+                        ticket,
+                        holidays
+                    );
+
+
+                if (
+                    sla.firstResponseState ===
+                    "AT_RISK" ||
+                    sla.resolutionState ===
+                    "AT_RISK"
+                ) {
+                    atRiskTickets++;
+                }
+
+
+                if (
+                    sla.firstResponseState ===
+                    "BREACHED" ||
+                    sla.resolutionState ===
+                    "BREACHED"
+                ) {
+                    breachedTickets++;
+                }
+            }
+
+
+            return {
+                openTickets,
+                inProgressTickets,
+                atRiskTickets,
+                breachedTickets,
+            };
+        },
+
+
+        // ----------------------------------------------------
+        // USERS
+        // ----------------------------------------------------
+
+        users: async (
+            _: unknown,
+            args: UserQueryArgs,
+            context: Context
+        ) => {
+
+            requireAuth(context);
+
+            return prisma.user.findMany({
+                where: args.role
+                    ? {
+                        role: args.role,
+                    }
+                    : undefined,
+
+                orderBy: {
+                    name: "asc",
+                },
+            });
+        },
+
+
+        // ----------------------------------------------------
+        // AGENTS
+        // ----------------------------------------------------
+
+        agents: async (
+            _: unknown,
+            __: unknown,
+            context: Context
+        ) => {
+
+            requireRole(
+                context,
+                ["AGENT", "ADMIN"]
+            );
+
+            return prisma.user.findMany({
+                where: {
+                    role: "AGENT",
+                },
+                orderBy: {
+                    name: "asc",
+                },
+            });
+        },
+
+
+        // ----------------------------------------------------
+        // HOLIDAYS
+        // ----------------------------------------------------
 
         holidays: async (
             _: unknown,
             __: unknown,
             context: Context
         ) => {
+
             requireAuth(context);
 
             return prisma.holiday.findMany({
@@ -294,110 +827,126 @@ export const resolvers = {
             });
         },
 
-        // --------------------------------
-        // AGENTS
-        // --------------------------------
-        agents: async (
-            _: unknown,
-            __: unknown,
-            context: Context
-        ) => {
-            const user = requireRole(
-                context,
-                ["AGENT", "ADMIN"]
-            );
 
-            return prisma.user.findMany({
-                where: { role: "AGENT" },
-                orderBy: { name: "asc" },
-            });
-        },
-
-
-        // --------------------------------
-        // CREATE USER
-        // --------------------------------
-
-        users: async (
-            _: unknown,
-            __: unknown,
-            context: Context
-        ) => {
-            const user = requireRole(
-                context,
-                ["AGENT", "ADMIN"]
-            );
-
-            return prisma.user.findMany({
-                orderBy: {
-                    createdAt: "desc",
-                },
-            });
-        },
-
-        // --------------------------------
+        // ----------------------------------------------------
         // CURRENT USER
-        // --------------------------------
+        // ----------------------------------------------------
+
         me: async (
             _: unknown,
             __: unknown,
             context: Context
         ) => {
-            return context.user;
+
+            return requireAuth(context);
         },
     },
 
+
+    // ========================================================
+    // MUTATIONS
+    // ========================================================
+
     Mutation: {
-        // --------------------------------
+
+        // ----------------------------------------------------
         // REGISTER
-        // --------------------------------
+        // ----------------------------------------------------
+
         register: async (
             _: unknown,
             args: {
                 name: string;
                 email: string;
                 password: string;
-                role: "USER" | "AGENT" | "ADMIN";
+                role: UserRole;
             }
         ) => {
+
+            const name =
+                args.name.trim();
+
+            const email =
+                args.email.trim().toLowerCase();
+
+
+            if (!name) {
+                throw new AppError(
+                    "Name cannot be empty.",
+                    ERROR_CODES.VALIDATION_ERROR
+                );
+            }
+
+
+            if (!email) {
+                throw new AppError(
+                    "Email cannot be empty.",
+                    ERROR_CODES.VALIDATION_ERROR
+                );
+            }
+
+
+            if (
+                args.password.length < 6
+            ) {
+                throw new AppError(
+                    "Password must be at least 6 characters.",
+                    ERROR_CODES.VALIDATION_ERROR
+                );
+            }
+
+
+            /*
+             * Public registration must not allow
+             * users to create ADMIN accounts.
+             */
+
+            if (args.role === "ADMIN") {
+                throw new AppError(
+                    "ADMIN accounts cannot be created through public registration.",
+                    ERROR_CODES.FORBIDDEN
+                );
+            }
+
+
             const existingUser =
                 await prisma.user.findUnique({
                     where: {
-                        email: args.email,
+                        email,
                     },
                 });
 
+
             if (existingUser) {
-                throw new Error(
-                    "Email already registered"
+                throw new AppError(
+                    "Email is already registered.",
+                    ERROR_CODES.CONFLICT
                 );
             }
 
-            if (args.password.length < 6) {
-                throw new Error(
-                    "Password must be at least 6 characters"
-                );
-            }
 
             const passwordHash =
-                await hashPassword(args.password);
-
-            if (args.role === "ADMIN") {
-                throw new Error(
-                    "ADMIN accounts cannot be created through public registration."
+                await hashPassword(
+                    args.password
                 );
-            }
 
-            const user = await prisma.user.create({
-                data: {
-                    name: args.name,
-                    email: args.email,
-                    passwordHash,
-                    role: args.role,
-                },
-            });
 
-            const token = await createToken(user.id);
+            const user =
+                await prisma.user.create({
+                    data: {
+                        name,
+                        email,
+                        passwordHash,
+                        role: args.role,
+                    },
+                });
+
+
+            const token =
+                await createToken(
+                    user.id
+                );
+
 
             return {
                 token,
@@ -405,9 +954,11 @@ export const resolvers = {
             };
         },
 
-        // --------------------------------
+
+        // ----------------------------------------------------
         // LOGIN
-        // --------------------------------
+        // ----------------------------------------------------
+
         login: async (
             _: unknown,
             args: {
@@ -415,18 +966,28 @@ export const resolvers = {
                 password: string;
             }
         ) => {
+
+            const email =
+                args.email
+                    .trim()
+                    .toLowerCase();
+
+
             const user =
                 await prisma.user.findUnique({
                     where: {
-                        email: args.email,
+                        email,
                     },
                 });
 
+
             if (!user) {
-                throw new Error(
-                    "Invalid email or password"
+                throw new AppError(
+                    "Invalid email or password.",
+                    ERROR_CODES.UNAUTHORIZED
                 );
             }
+
 
             const validPassword =
                 await verifyPassword(
@@ -434,13 +995,20 @@ export const resolvers = {
                     user.passwordHash
                 );
 
+
             if (!validPassword) {
-                throw new Error(
-                    "Invalid email or password"
+                throw new AppError(
+                    "Invalid email or password.",
+                    ERROR_CODES.UNAUTHORIZED
                 );
             }
 
-            const token = await createToken(user.id);
+
+            const token =
+                await createToken(
+                    user.id
+                );
+
 
             return {
                 token,
@@ -448,9 +1016,11 @@ export const resolvers = {
             };
         },
 
-        // --------------------------------
+
+        // ----------------------------------------------------
         // CREATE TICKET
-        // --------------------------------
+        // ----------------------------------------------------
+
         createTicket: async (
             _: unknown,
             args: {
@@ -460,78 +1030,118 @@ export const resolvers = {
             },
             context: Context
         ) => {
-            const user = requireAuth(context);
 
-            if (args.title.trim().length === 0) {
-                throw new Error("Title cannot be empty");
+            const user =
+                requireAuth(context);
+
+
+            const title =
+                args.title.trim();
+
+            const description =
+                args.description.trim();
+
+
+            if (!title) {
+                throw new AppError(
+                    "Ticket title cannot be empty.",
+                    ERROR_CODES.VALIDATION_ERROR
+                );
             }
 
-            if (args.description.trim().length === 0) {
-                throw new Error("Description cannot be empty");
+
+            if (!description) {
+                throw new AppError(
+                    "Ticket description cannot be empty.",
+                    ERROR_CODES.VALIDATION_ERROR
+                );
             }
 
-            const createdAt = new Date();
+
+            const createdAt =
+                new Date();
+
 
             const holidays =
                 await getHolidayKeys();
 
+
             const {
                 firstResponseDueAt,
                 resolutionDueAt,
-            } = calculateSlaDeadlines(
-                createdAt,
-                args.priority,
-                holidays
-            );
+            } =
+                calculateSlaDeadlines(
+                    createdAt,
+                    args.priority,
+                    holidays
+                );
+
 
             return prisma.ticket.create({
                 data: {
-                    title: args.title.trim(),
-                    description: args.description.trim(),
+                    title,
+                    description,
                     priority: args.priority,
-                    creatorId: user.id,
+
+                    creatorId:
+                        user.id,
+
                     firstResponseDueAt,
                     resolutionDueAt,
+
                     createdAt,
                 },
+
                 include: ticketInclude,
             });
         },
 
-        // --------------------------------
+
+        // ----------------------------------------------------
         // ASSIGN TICKET
-        // --------------------------------
+        // ----------------------------------------------------
+
         assignTicket: async (
             _: unknown,
             args: {
                 ticketId: string;
-                agentId: string;
+                assigneeId: string;
             },
             context: Context
         ) => {
-            const user = requireRole(
-                context,
-                ["AGENT", "ADMIN"]
-            );
+
+            const user =
+                requireRole(
+                    context,
+                    ["AGENT", "ADMIN"]
+                );
+
 
             const agent =
                 await prisma.user.findUnique({
                     where: {
-                        id: args.agentId,
+                        id: args.assigneeId,
                     },
                 });
 
+
             if (!agent) {
-                throw new Error(
-                    "Agent not found"
+                throw new AppError(
+                    "Assignee not found.",
+                    ERROR_CODES.USER_NOT_FOUND
                 );
             }
 
-            if (agent.role !== "AGENT") {
-                throw new Error(
-                    "Selected user is not an agent"
+
+            if (
+                agent.role !== "AGENT"
+            ) {
+                throw new AppError(
+                    "Selected user is not an agent.",
+                    ERROR_CODES.VALIDATION_ERROR
                 );
             }
+
 
             const ticket =
                 await prisma.ticket.findUnique({
@@ -540,27 +1150,136 @@ export const resolvers = {
                     },
                 });
 
+
             if (!ticket) {
-                throw new Error(
-                    "Ticket not found"
+                throw new AppError(
+                    "Ticket not found.",
+                    ERROR_CODES.TICKET_NOT_FOUND
                 );
             }
 
+
+            /*
+             * An AGENT should not arbitrarily assign tickets
+             * to another agent unless your permission model
+             * explicitly allows it.
+             *
+             * ADMIN can assign freely.
+             *
+             * An agent can assign a ticket to themselves.
+             */
+
+            if (
+                user.role === "AGENT" &&
+                args.assigneeId !== user.id
+            ) {
+                throw new AppError(
+                    "Agents can only assign tickets to themselves.",
+                    ERROR_CODES.FORBIDDEN
+                );
+            }
+
+
             return prisma.ticket.update({
                 where: {
-                    id: args.ticketId,
+                    id: ticket.id,
                 },
+
                 data: {
-                    agentId: args.agentId,
-                    status: "IN_PROGRESS",
+                    agentId:
+                        args.assigneeId,
                 },
+
                 include: ticketInclude,
             });
         },
 
-        // --------------------------------
+
+        // ----------------------------------------------------
+        // CHANGE TICKET STATUS
+        // ----------------------------------------------------
+
+        changeTicketStatus: async (
+            _: unknown,
+            args: {
+                ticketId: string;
+                status: TicketStatus;
+            },
+            context: Context
+        ) => {
+
+            const user =
+                requireRole(
+                    context,
+                    ["AGENT", "ADMIN"]
+                );
+
+
+            const ticket =
+                await prisma.ticket.findUnique({
+                    where: {
+                        id: args.ticketId,
+                    },
+                });
+
+
+            if (!ticket) {
+                throw new AppError(
+                    "Ticket not found.",
+                    ERROR_CODES.TICKET_NOT_FOUND
+                );
+            }
+
+
+            if (
+                user.role === "AGENT" &&
+                ticket.agentId !== user.id
+            ) {
+                throw new AppError(
+                    "You are not allowed to update this ticket.",
+                    ERROR_CODES.FORBIDDEN
+                );
+            }
+
+
+            validateStatusTransition(
+                ticket.status,
+                args.status
+            );
+
+
+            const data: {
+                status: TicketStatus;
+                resolvedAt?: Date;
+            } = {
+                status: args.status,
+            };
+
+
+            if (
+                args.status === "RESOLVED"
+            ) {
+                data.resolvedAt =
+                    ticket.resolvedAt ??
+                    new Date();
+            }
+
+
+            return prisma.ticket.update({
+                where: {
+                    id: ticket.id,
+                },
+
+                data,
+
+                include: ticketInclude,
+            });
+        },
+
+
+        // ----------------------------------------------------
         // RESOLVE TICKET
-        // --------------------------------
+        // ----------------------------------------------------
 
         resolveTicket: async (
             _: unknown,
@@ -569,7 +1288,13 @@ export const resolvers = {
             },
             context: Context
         ) => {
-            const user = requireAuth(context);
+
+            const user =
+                requireRole(
+                    context,
+                    ["AGENT", "ADMIN"]
+                );
+
 
             const ticket =
                 await prisma.ticket.findUnique({
@@ -578,164 +1303,56 @@ export const resolvers = {
                     },
                 });
 
+
             if (!ticket) {
-                throw new Error(
-                    "Ticket not found"
+                throw new AppError(
+                    "Ticket not found.",
+                    ERROR_CODES.TICKET_NOT_FOUND
                 );
             }
 
-            if (user.role === "USER") {
-                throw new Error(
-                    "Users cannot resolve tickets"
-                );
-            }
 
             if (
                 user.role === "AGENT" &&
                 ticket.agentId !== user.id
             ) {
-                throw new Error(
-                    "You are not allowed to resolve this ticket"
+                throw new AppError(
+                    "You are not allowed to resolve this ticket.",
+                    ERROR_CODES.FORBIDDEN
                 );
             }
+
 
             validateStatusTransition(
                 ticket.status,
                 "RESOLVED"
             );
 
-            const resolvedAt = new Date();
+
+            const resolvedAt =
+                new Date();
+
 
             return prisma.ticket.update({
                 where: {
                     id: ticket.id,
                 },
+
                 data: {
                     status: "RESOLVED",
                     resolvedAt,
                 },
+
                 include: ticketInclude,
             });
         },
 
 
-        // --------------------------------
-        // UPDATE USERROLE
-        // --------------------------------
-        updateUserRole: async (
-            _: unknown,
-            args: {
-                userId: string;
-                role: "USER" | "AGENT" | "ADMIN";
-            },
-            context: Context
-        ) => {
-            const currentUser = requireRole(context, ["ADMIN"]);
+        // ----------------------------------------------------
+        // ADD COMMENT
+        // ----------------------------------------------------
 
-            if (currentUser.id === args.userId) {
-                throw new Error(
-                    "You cannot change your own role"
-                );
-            }
-
-            const user = await prisma.user.findUnique({
-                where: {
-                    id: args.userId,
-                },
-            });
-
-            if (!user) {
-                throw new Error("User not found");
-            }
-
-            return prisma.user.update({
-                where: {
-                    id: args.userId,
-                },
-                data: {
-                    role: args.role,
-                },
-            });
-        },
-
-        // --------------------------------
-        // UPDATE TICKET STATUS
-        // --------------------------------
-        updateTicketStatus: async (
-            _: unknown,
-            args: {
-                ticketId: string;
-                status: TicketStatus;
-            },
-            context: Context
-        ) => {
-            const user = requireAuth(context);
-
-            const ticket =
-                await prisma.ticket.findUnique({
-                    where: {
-                        id: args.ticketId,
-                    },
-                });
-
-            if (!ticket) {
-                throw new Error(
-                    "Ticket not found"
-                );
-            }
-
-            validateStatusTransition(
-                ticket.status,
-                args.status
-            );
-
-            // USER cannot manage ticket status
-            if (user.role === "USER") {
-                throw new Error(
-                    "Users cannot update ticket status"
-                );
-            }
-
-            // AGENT can only update tickets assigned to them
-            if (
-                user.role === "AGENT" &&
-                ticket.agentId !== user.id
-            ) {
-                throw new Error(
-                    "You are not allowed to update this ticket"
-                );
-            }
-
-            const data: {
-                status: TicketStatus;
-                firstResponseAt?: Date;
-                resolvedAt?: Date;
-            } = {
-                status: args.status,
-            };
-
-            // Resolution
-            if (
-                args.status === "RESOLVED" &&
-                !ticket.resolvedAt
-            ) {
-                data.resolvedAt =
-                    new Date();
-            }
-
-            return prisma.ticket.update({
-                where: {
-                    id: args.ticketId,
-                },
-                data,
-                include: ticketInclude,
-            });
-        },
-
-        // --------------------------------
-        // CREATE COMMENT
-        // --------------------------------
-        createComment: async (
+        addComment: async (
             _: unknown,
             args: {
                 ticketId: string;
@@ -743,7 +1360,22 @@ export const resolvers = {
             },
             context: Context
         ) => {
-            const user = requireAuth(context);
+
+            const user =
+                requireAuth(context);
+
+
+            const content =
+                args.content.trim();
+
+
+            if (!content) {
+                throw new AppError(
+                    "Comment cannot be empty.",
+                    ERROR_CODES.VALIDATION_ERROR
+                );
+            }
+
 
             const ticket =
                 await prisma.ticket.findUnique({
@@ -752,57 +1384,90 @@ export const resolvers = {
                     },
                 });
 
+
             if (!ticket) {
-                throw new Error(
-                    "Ticket not found"
+                throw new AppError(
+                    "Ticket not found.",
+                    ERROR_CODES.TICKET_NOT_FOUND
                 );
             }
+
+
+            // -----------------------------------------------
+            // USER
+            // -----------------------------------------------
 
             if (
                 user.role === "USER" &&
                 ticket.creatorId !== user.id
             ) {
-                throw new Error(
-                    "You are not allowed to comment on this ticket"
+                throw new AppError(
+                    "You are not allowed to comment on this ticket.",
+                    ERROR_CODES.FORBIDDEN
                 );
             }
+
+
+            // -----------------------------------------------
+            // AGENT
+            // -----------------------------------------------
 
             if (
                 user.role === "AGENT" &&
                 ticket.agentId !== user.id
             ) {
-                throw new Error(
-                    "You are not allowed to comment on this ticket"
+                throw new AppError(
+                    "You are not allowed to comment on this ticket.",
+                    ERROR_CODES.FORBIDDEN
                 );
             }
 
-            if (args.content.trim().length === 0) {
-                throw new Error(
-                    "Comment cannot be empty"
-                );
-            }
+
+            // -----------------------------------------------
+            // CREATE COMMENT
+            // -----------------------------------------------
 
             const comment =
                 await prisma.comment.create({
                     data: {
-                        content: args.content.trim(),
-                        ticketId: args.ticketId,
-                        authorId: user.id,
+                        content,
+                        ticketId:
+                            ticket.id,
+                        authorId:
+                            user.id,
                     },
+
                     include: {
                         author: true,
                     },
                 });
 
-            // Track first response
+
+            // -----------------------------------------------
+            // FIRST RESPONSE
+            // -----------------------------------------------
+
+            /*
+             * The first comment by someone other than
+             * the reporter is the first response.
+             *
+             * updateMany with firstResponseAt = null
+             * prevents a later comment from overwriting
+             * the original response timestamp.
+             */
+
             if (
-                user.id !== ticket.creatorId &&
+                user.id !==
+                ticket.creatorId &&
                 !ticket.firstResponseAt
             ) {
-                await prisma.ticket.update({
+
+                await prisma.ticket.updateMany({
                     where: {
                         id: ticket.id,
+                        firstResponseAt: null,
                     },
+
                     data: {
                         firstResponseAt:
                             comment.createdAt,
@@ -810,7 +1475,67 @@ export const resolvers = {
                 });
             }
 
+
             return comment;
+        },
+
+
+        // ----------------------------------------------------
+        // UPDATE USER ROLE
+        // ----------------------------------------------------
+
+        updateUserRole: async (
+            _: unknown,
+            args: {
+                userId: string;
+                role: UserRole;
+            },
+            context: Context
+        ) => {
+
+            const currentUser =
+                requireRole(
+                    context,
+                    ["ADMIN"]
+                );
+
+
+            if (
+                currentUser.id ===
+                args.userId
+            ) {
+                throw new AppError(
+                    "You cannot change your own role.",
+                    ERROR_CODES.FORBIDDEN
+                );
+            }
+
+
+            const user =
+                await prisma.user.findUnique({
+                    where: {
+                        id: args.userId,
+                    },
+                });
+
+
+            if (!user) {
+                throw new AppError(
+                    "User not found.",
+                    ERROR_CODES.USER_NOT_FOUND
+                );
+            }
+
+
+            return prisma.user.update({
+                where: {
+                    id: args.userId,
+                },
+
+                data: {
+                    role: args.role,
+                },
+            });
         },
     },
 };
