@@ -18,12 +18,6 @@ enum TicketStatus {
   CLOSED
 }
 
-enum SLAStatus {
-  ON_TRACK
-  AT_RISK
-  BREACHED
-}
-
 enum SLAState {
   ON_TRACK
   AT_RISK
@@ -95,29 +89,41 @@ type AuthPayload {
 input TicketFilter {
   status: TicketStatus
   priority: TicketPriority
-  slaStatus: SLAStatus
+  assigneeId: ID
+  slaState: SLAState
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  endCursor: String
 }
 
 type TicketConnection {
-  items: [Ticket!]!
-  total: Int!
-  page: Int!
-  pageSize: Int!
-  totalPages: Int!
+  nodes: [Ticket!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type TicketDashboard {
+  openTickets: Int!
+  inProgressTickets: Int!
+  atRiskTickets: Int!
+  breachedTickets: Int!
 }
 
 type Query {
   tickets(
     filter: TicketFilter
-    page: Int = 1
-    pageSize: Int = 10
+    take: Int
+    cursor: String
   ): TicketConnection!
 
   ticket(id: ID!): Ticket
 
   me: User
   agents: [User!]!
-  users: [User!]!
+  dashboard: TicketDashboard!
+  users(role: UserRole): [User!]!
   holidays: [Holiday!]!
 }
 
@@ -150,17 +156,19 @@ type Mutation {
     agentId: ID!
   ): Ticket!
 
-  resolveTicket(
-  ticketId: ID!
-): Ticket!
-
-  updateTicketStatus(
+  changeTicketStatus(
     ticketId: ID!
     status: TicketStatus!
   ): Ticket!
 
-  createComment(
+  addComment(
     ticketId: ID!
     content: String!
   ): Comment!
+
+  resolveTicket(
+  ticketId: ID!
+): Ticket!
+
+
 }
