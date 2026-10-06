@@ -259,17 +259,39 @@ async function calculateTicketSLA(
     };
 }
 
+function iso(value: Date | null | undefined): string | null {
+    return value ? value.toISOString() : null;
+}
+
 // ============================================================
 // RESOLVERS
 // ============================================================
 
 export const resolvers = {
 
+    User: {
+        createdAt: (user: { createdAt: Date }) => iso(user.createdAt),
+    },
+
+    Comment: {
+        createdAt: (comment: { createdAt: Date }) => iso(comment.createdAt),
+    },
+
+    Holiday: {
+        date: (holiday: { date: Date }) => iso(holiday.date),
+        createdAt: (holiday: { createdAt: Date }) => iso(holiday.createdAt),
+    },
+
     // ========================================================
     // TICKET
     // ========================================================
 
     Ticket: {
+
+        createdAt: (t: { createdAt: Date }) => iso(t.createdAt),
+        updatedAt: (t: { updatedAt: Date }) => iso(t.updatedAt),
+        firstResponseAt: (t: { firstResponseAt: Date | null }) => iso(t.firstResponseAt),
+        resolvedAt: (t: { resolvedAt: Date | null }) => iso(t.resolvedAt),
 
         firstResponseDueAt: async (
             ticket: {
@@ -331,9 +353,6 @@ export const resolvers = {
 
             let firstResponseDueAt = ticket.firstResponseDueAt;
             let resolutionDueAt = ticket.resolutionDueAt;
-
-            console.log("firstResponsedueAt: ", firstResponseDueAt);
-            console.log("type: ", typeof (firstResponseDueAt));
 
             // Support tickets created before SLA deadlines were persisted.
             if (!firstResponseDueAt || !resolutionDueAt) {
@@ -766,7 +785,7 @@ export const resolvers = {
             context: Context
         ) => {
 
-            requireAuth(context);
+            requireRole(context, ["ADMIN"]);
 
             return prisma.user.findMany({
                 where: args.role
@@ -937,7 +956,7 @@ export const resolvers = {
                         name,
                         email,
                         passwordHash,
-                        role: args.role,
+                        role: "USER",
                     },
                 });
 
@@ -1105,7 +1124,7 @@ export const resolvers = {
             _: unknown,
             args: {
                 ticketId: string;
-                assigneeId: string;
+                agentId: string;
             },
             context: Context
         ) => {
@@ -1120,7 +1139,7 @@ export const resolvers = {
             const agent =
                 await prisma.user.findUnique({
                     where: {
-                        id: args.assigneeId,
+                        id: args.agentId,
                     },
                 });
 
@@ -1171,7 +1190,7 @@ export const resolvers = {
 
             if (
                 user.role === "AGENT" &&
-                args.assigneeId !== user.id
+                args.agentId !== user.id
             ) {
                 throw new AppError(
                     "Agents can only assign tickets to themselves.",
@@ -1187,7 +1206,7 @@ export const resolvers = {
 
                 data: {
                     agentId:
-                        args.assigneeId,
+                        args.agentId,
                 },
 
                 include: ticketInclude,
@@ -1247,23 +1266,23 @@ export const resolvers = {
                 args.status
             );
 
-
             const data: {
                 status: TicketStatus;
                 resolvedAt?: Date;
+                firstResponseAt?: Date;
             } = {
                 status: args.status,
             };
 
+            const now = new Date();
 
-            if (
-                args.status === "RESOLVED"
-            ) {
-                data.resolvedAt =
-                    ticket.resolvedAt ??
-                    new Date();
+            if (!ticket.firstResponseAt) {
+                data.firstResponseAt = now;
             }
 
+            if (args.status === "RESOLVED") {
+                data.resolvedAt = ticket.resolvedAt ?? now;
+            }
 
             return prisma.ticket.update({
                 where: {
@@ -1341,6 +1360,7 @@ export const resolvers = {
                 data: {
                     status: "RESOLVED",
                     resolvedAt,
+                    firstResponseAt: ticket.firstResponseAt ?? resolvedAt,
                 },
 
                 include: ticketInclude,

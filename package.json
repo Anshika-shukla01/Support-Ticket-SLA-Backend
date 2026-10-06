@@ -21,6 +21,7 @@
     "@prisma/adapter-pg": "^7.10.0",
     "@prisma/client": "^7.10.0",
     "argon2": "^0.45.1",
+    "dotenv": "^18.0.5",
     "graphql": "^17.0.2",
     "graphql-yoga": "^5.22.0",
     "jose": "^6.2.10",
